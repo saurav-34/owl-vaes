@@ -215,8 +215,8 @@ class LandscapeToSquare(nn.Module):
         # x is [9, 16]
         _,_,h,w = x.shape
         target = find_nearest_square(h,w)
-        x = F.interpolate(x, target, mode='bicubic')
         x = self.proj(x)
+        x = F.interpolate(x, target, mode='bicubic')
         return x
 
 class SquareToLandscape(nn.Module):
@@ -230,7 +230,7 @@ class SquareToLandscape(nn.Module):
         # x is [1,1]
         _,_,h,w = x.shape
         target = find_nearest_landscape(h,w)
-        x = self.proj(x)
         x = F.interpolate(x, target, mode='bicubic')
+        x = self.proj(x)
         return x
 
