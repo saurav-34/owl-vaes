@@ -20,6 +20,8 @@ from ..utils.logging import LogHelper, to_wandb_video_sidebyside
 from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
 from ..losses.dwt import dwt_loss_fn_3d
+from ..losses.outlier import outlier_penalty_loss
+from ..sampling.tiling_3d import tiled_rec
 
 class VideoRecTrainer(BaseTrainer):
     """
@@ -86,6 +88,7 @@ class VideoRecTrainer(BaseTrainer):
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
+        opl_weight = self.train_cfg.loss_weights.get('opl', 0.0)
 
         # Prepare model, lpips, ema
         self.model = self.model.cuda().train()
@@ -130,6 +133,12 @@ class VideoRecTrainer(BaseTrainer):
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, rank=self.rank, world_size=self.world_size, **self.train_cfg.data_kwargs)
+        
+        # Sample loader
+        sample_data_kwargs = self.train_cfg.data_kwargs.copy()
+        sample_data_kwargs['window_length'] = self.train_cfg.sample_window_length
+        sample_loader = get_loader(self.train_cfg.data_id, 1, rank=self.rank, world_size=self.world_size, **sample_data_kwargs)
+        sample_loader = iter(sample_loader)
 
         local_step = 0
 
@@ -153,13 +162,7 @@ class VideoRecTrainer(BaseTrainer):
                 batch = video_interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
-                    batch_rec, mu, logvar = self.model(batch)
-                    z = mu # For logging
- 
-                    if kl_weight > 0.0:
-                        reg_loss = latent_reg_loss(mu, logvar) / accum_steps
-                        total_loss += reg_loss * kl_weight
-                        metrics.log('kl_loss', reg_loss)
+                    batch_rec, z = self.model(batch)
 
                     if l1_weight > 0.0:
                         l1_loss = F.l1_loss(batch_rec, batch) / accum_steps
@@ -180,6 +183,11 @@ class VideoRecTrainer(BaseTrainer):
                         lpips_loss = lpips(flatten_vid(batch_rec), flatten_vid(batch)) / accum_steps
                         total_loss += lpips_loss
                         metrics.log('lpips_loss', lpips_loss)
+                    
+                    if opl_weight > 0.0:
+                        opl_loss = outlier_penalty_loss(flatten_vid(z)) * opl_weight
+                        total_loss += opl_loss
+                        metrics.log('opl_loss', opl_loss)
 
                 self.scaler.scale(total_loss).backward()
 
@@ -188,16 +196,14 @@ class VideoRecTrainer(BaseTrainer):
                         'z_std' : z.detach().std() / accum_steps,
                         'z_shift' : z.detach().mean() / accum_steps,
                         'z_max' : z.detach().max() / accum_steps,
-                        'z_min' : z.detach().min() / accum_steps,
-                        'std_avg' : logvar.exp().sqrt().detach().mean() / accum_steps
+                        'z_min' : z.detach().min() / accum_steps
                     })
 
                 local_step += 1
                 if local_step % accum_steps == 0:
                     # Updates
-                    if self.train_cfg.opt.lower() != "muon":
-                        self.scaler.unscale_(self.opt)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                    self.scaler.unscale_(self.opt)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
@@ -215,13 +221,23 @@ class VideoRecTrainer(BaseTrainer):
                         timer.reset()
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
-                            with ctx:
-                                full_batch_rec = self.model(full_batch)[0]
-                            
-                            wandb_dict['samples'] = to_wandb_video_sidebyside(
-                                full_batch.detach().contiguous().bfloat16(),
-                                full_batch_rec.detach().contiguous().bfloat16()
-                            )
+                             with ctx:
+                                batches = []
+                                recs = []
+                                for _ in range(4):
+                                    this_batch = next(sample_loader).to(self.device).bfloat16()
+                                    batches.append(this_batch)
+                                    this_rec = tiled_rec(self.model.module.encoder, self.model.module.decoder, this_batch)
+                                    recs.append(this_rec)
+
+                                batches = torch.cat(batches, dim=0)
+                                recs = torch.cat(recs, dim=0)
+
+                                wandb_dict['samples'] = to_wandb_video_sidebyside(
+                                    batches.detach().contiguous().bfloat16(),
+                                    recs.detach().contiguous().bfloat16(),
+                                    fps = self.train_cfg.sample_fps
+                                )
                         if self.rank == 0:
                             wandb.log(wandb_dict)
 

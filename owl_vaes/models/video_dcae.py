@@ -3,25 +3,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..nn.normalization import GroupNorm
 from ..nn.resnet import (
-    DownBlock, SameBlock, UpBlock,
-    LandscapeToSquare, SquareToLandscape
+    LandscapeToSquare, SquareToLandscape,
+    WeightNormConv2d
 )
-from ..nn.sana import (
-    ChannelToSpace, SpaceToChannel,
-    ChannelAverage, ChannelDuplication
+from ..nn.resnet_3d import (
+    DownBlock3D, UpBlock3D, CausConv3d,
+    TemporalDownsample, TemporalUpsample,
+    LandscapeToSquare3D, SquareToLandscape3D
 )
-from ..nn.video_ae import (
-    get_frame_causal_attn_mask,
-    CausalFrameAttn,
-    TemporalDownsample,
-    TemporalUpsample,
+from ..nn.sana_3d import (
+    ChannelToSpace3D, SpaceToChannel3D,
+    ChannelAverage3D, ChannelDuplication3D,
+    flatten_pixel_shuffle, flatten_pixel_unshuffle
 )
 
-from ..nn.resnet import WeightNormConv2d
-from torch.utils.checkpoint import checkpoint
-import torch.distributions as dist
 from copy import deepcopy
 
 def is_landscape(config):
@@ -32,6 +28,18 @@ def is_landscape(config):
     if sample_size[0] < sample_size[1]: # width > height
         return True
     return False
+
+def swap_tc(x):
+    # b,t,c,h,w -> b,c,t,h,w
+    b,t,c,h,w = x.shape
+    x = x.permute(0, 2, 1, 3, 4)
+    return x
+
+def swap_ct(x):
+    # b,c,t,h,w -> b,t,c,h,w
+    b,c,t,h,w = x.shape
+    x = x.permute(0, 2, 1, 3, 4)
+    return x
 
 def batch(x):
     b,t,c,h,w = x.shape
@@ -44,9 +52,9 @@ def unbatch(x, b):
     return x
 
 def latent_ln(z, eps=1e-6):
-    # z: [b, c, h, w]
-    mean = z.mean(dim=(1, 2, 3), keepdim=True)
-    var  = z.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+    # z: [b, c, t, h, w]
+    mean = z.mean(dim=(1, 2, 3, 4), keepdim=True)
+    var  = z.var(dim=(1, 2, 3, 4), keepdim=True, unbiased=False)
     return (z - mean) / torch.sqrt(var + eps)
 
 class Encoder(nn.Module):
@@ -58,107 +66,59 @@ class Encoder(nn.Module):
         latent_size = config.latent_size
         ch_0 = config.ch_0
         ch_max = config.ch_max
-        self.skip_logvar = getattr(config, "skip_logvar", False)
 
         self.latent_channels = config.latent_channels
         self.is_landscape = is_landscape(config)
-        self.conv_in = LandscapeToSquare(config.channels, ch_0) if self.is_landscape else WeightNormConv2d(config.channels, ch_0, 3, 1, 1)
+        self.encoder_chunk_size = getattr(config, 'encoder_chunk_size', 4)
 
-        attn_config = deepcopy(config)
-        attn_config.sample_size = [int(attn_config.tokens_per_frame**0.5), int(attn_config.tokens_per_frame**0.5)]
-        attn_config.patch_size = 1
+        # Landscape to square transformation (keeps channels same, just reshapes spatially)
+        self.l2s = LandscapeToSquare3D(config.channels, config.channels) if self.is_landscape else nn.Identity()
+
+        self.conv_in = CausConv3d(config.channels * 4, ch_0, 3, 1, 1)
 
         blocks = []
         residuals = []
-        attn_blocks = []
+        temp_downs = []
         ch = ch_0
 
         blocks_per_stage = config.encoder_blocks_per_stage
-        total_blocks = len(blocks_per_stage)
+        total_blocks = sum(blocks_per_stage)
 
         for i, block_count in enumerate(blocks_per_stage):
             next_ch = min(ch*2, ch_max)
 
-            blocks.append(DownBlock(ch, next_ch, block_count, total_blocks))
-            residuals.append(SpaceToChannel(ch, next_ch))
-            attn_blocks.append(CausalFrameAttn(next_ch, attn_config) if i > 1 else nn.Identity())
+            is_temporal = (i < 2)
+
+            blocks.append(DownBlock3D(ch, next_ch, block_count, total_blocks))
+            residuals.append(SpaceToChannel3D(ch, next_ch))
+            temp_downs.append(TemporalDownsample(next_ch, next_ch) if is_temporal else nn.Identity())
 
             ch = next_ch
 
         self.blocks = nn.ModuleList(blocks)
         self.residuals = nn.ModuleList(residuals)
-        self.attn_blocks = nn.ModuleList(attn_blocks)
-        self.avg_factor = ch // config.latent_channels
-        
-        self.conv_out = ChannelAverage(ch, config.latent_channels)
-        
-        self.conv_out_logvar = WeightNormConv2d(ch, 1, 3, 1, 1) if not self.skip_logvar else None
+        self.temp_downs = nn.ModuleList(temp_downs)
 
-        # TODO, this is sloppy
-        self.down = nn.ModuleList([
-            nn.Identity(),
-            nn.Identity(),
-            TemporalDownsample(min(ch_0 * 4, ch_max)),
-            TemporalDownsample(min(ch_0 * 4, ch_max)),
-            #nn.Identity(),
-            #nn.Identity(),
-        ])
-        self.normalize_mu = getattr(config, 'normalize_mu', False)
-        self.clamp_mu = getattr(config, 'clamp_mu', False)
-        self.n_frames = getattr(config, 'n_frames', 1)
+        self.conv_out = ChannelAverage3D(ch, config.latent_channels)
 
-    def forward(self, x, kv_cache = None, attn_mask = None):
-        if attn_mask is None:
-            # Calculate actual sequence length: frames * tokens_per_frame
-            tokens_per_frame = self.config.tokens_per_frame
-            seq_len = x.shape[1] * tokens_per_frame
-
-            attn_mask_1 = get_frame_causal_attn_mask(
-                self.config,
-                batch_size = x.shape[0],
-                device = x.device,
-                max_q_len = seq_len,
-                max_kv_len = seq_len,
-                kernel_size = getattr(self.config, "encoder_kernel", None)
-            )
-            attn_mask_2 = get_frame_causal_attn_mask(
-                self.config,
-                batch_size = x.shape[0],
-                device = x.device,
-                max_q_len = seq_len//2,
-                max_kv_len = seq_len//2,
-                kernel_size = getattr(self.config, "encoder_kernel", None)
-            )
-            # Accounting for temporal downsampling
-
+    def forward(self, x):
+        """
+        btchw in -> btchw out
+        """
         b = x.shape[0]
-        x = batch(x)
+        x = swap_tc(x) # -> bcthw
+        x = self.l2s(x) # landscape -> square if needed
+        x = flatten_pixel_unshuffle(x)
         x = self.conv_in(x)
-        for i, (block, shortcut, attn, down) in enumerate(zip(self.blocks, self.residuals, self.attn_blocks, self.down)):
-            res = shortcut(x)
-            x = block(x) + res
-            x = unbatch(x, b)
-            if i > 1:
-                x = attn(x, kv_cache, attn_mask_1 if i == 2 else attn_mask_2)
-                x = down(x)
-            x = batch(x)
+
+        for block, shortcut, temp_down in zip(self.blocks, self.residuals, self.temp_downs):
+            x = block(x) + shortcut(x)
+            x = temp_down(x)
 
         mu = self.conv_out(x)
-        if self.normalize_mu:
-            mu = latent_ln(mu)
-        if self.clamp_mu:
-            mu = torch.clamp(mu, -15.0, 15.0)
-        mu = unbatch(mu, b)
-
-        if not self.training:
-            return mu
-        else:
-            if self.skip_logvar:
-                return mu
-            logvar = self.conv_out_logvar(x)
-            logvar = logvar.repeat(1, self.latent_channels, 1, 1)
-            logvar = unbatch(logvar, b)
-            return mu, logvar
+        mu = latent_ln(mu)
+        mu = swap_ct(mu)
+        return mu
 
 class Decoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
@@ -172,75 +132,53 @@ class Decoder(nn.Module):
         ch_0 = config.ch_0
         ch_max = config.ch_max
 
-        self.rep_factor = ch_max // config.latent_channels
-        self.conv_in = ChannelDuplication(config.latent_channels, ch_max)
-
-        attn_config = deepcopy(config)
-        attn_config.sample_size = [int(attn_config.tokens_per_frame**0.5), int(attn_config.tokens_per_frame**0.5)]
-        attn_config.patch_size = 1
+        self.conv_in = ChannelDuplication3D(config.latent_channels, ch_max)
 
         blocks = []
         residuals = []
-        attn_blocks = []
+        temp_ups = []
+
         ch = ch_0
 
         blocks_per_stage = config.decoder_blocks_per_stage
-        total_blocks = len(blocks_per_stage)
+        total_blocks = sum(blocks_per_stage)
 
-        for block_count in blocks_per_stage:
+        for i, block_count in enumerate(blocks_per_stage):
             next_ch = min(ch*2, ch_max)
 
-            blocks.append(UpBlock(next_ch, ch, block_count, total_blocks))
-            residuals.append(ChannelToSpace(next_ch, ch))
-            attn_blocks.append(CausalFrameAttn(next_ch, attn_config))
+            is_temporal = (i < 2)
+
+            temp_ups.append(TemporalUpsample(next_ch, next_ch) if is_temporal else nn.Identity())
+            blocks.append(UpBlock3D(next_ch, ch, block_count, total_blocks))
+            residuals.append(ChannelToSpace3D(next_ch, ch))
 
             ch = next_ch
 
         self.blocks = nn.ModuleList(list(reversed(blocks)))
         self.residuals = nn.ModuleList(list(reversed(residuals)))
-        self.attn_blocks = nn.ModuleList(list(reversed(attn_blocks)))
+        self.temp_ups = nn.ModuleList(list(reversed(temp_ups)))
 
-        self.conv_out = SquareToLandscape(ch_0, config.channels) if self.is_landscape else WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
         self.act_out = nn.SiLU()
+        self.conv_out = CausConv3d(ch_0, config.channels*4, 3, 1, 1)
 
-        self.up = nn.ModuleList([
-            nn.Identity(),
-            TemporalUpsample(min(ch_0 * 8, ch_max)),
-            TemporalUpsample(min(ch_0 * 4, ch_max)),
-            nn.Identity(),
-        ])
-        self.n_frames = getattr(config, 'n_frames', 1)
+        # Square to landscape transformation (keeps channels same, just reshapes spatially)
+        self.s2l = SquareToLandscape3D(config.channels, config.channels) if self.is_landscape else nn.Identity()
+        
 
-    def forward(self, x, kv_cache = None, attn_mask = None):
-        if attn_mask is None:
-            # Calculate actual sequence length: frames * tokens_per_frame
-            tokens_per_frame = self.config.tokens_per_frame
-            seq_len = x.shape[1] * tokens_per_frame
-
-            attn_mask = get_frame_causal_attn_mask(
-                self.config,
-                batch_size = x.shape[0],
-                device = x.device,
-                max_q_len = seq_len,
-                max_kv_len = seq_len,
-                kernel_size = getattr(self.config, "decoder_kernel", None)
-            )
-
+    def forward(self, x):
         b = x.shape[0]
-        x = batch(x)
+        x = swap_tc(x)
         x = self.conv_in(x)
 
-        for i, (block, shortcut, attn, up) in enumerate(zip(self.blocks, self.residuals, self.attn_blocks, self.up)):
-            x = unbatch(x, b)
-            x = up(x)
-            x = attn(x, kv_cache, attn_mask)
-            x = batch(x)
-            res = shortcut(x)
-            x = block(x) + res
+        for block, shortcut, temp_up in zip(self.blocks, self.residuals, self.temp_ups):
+            x = temp_up(x)
+            x = block(x) + shortcut(x)
 
         x = self.act_out(x)
         x = self.conv_out(x)
-        x = unbatch(x, b)
+        x = flatten_pixel_shuffle(x)
+        x = self.s2l(x) # square -> landscape if needed
+        x = swap_ct(x)
         return x
 
 class VideoDCAE(nn.Module):
@@ -254,13 +192,11 @@ class VideoDCAE(nn.Module):
         self.decoder = Decoder(config)
 
         self.config = config
-
+        
     def forward(self, x):
-        mu, logvar = self.encoder(x)
-        z = torch.randn_like(mu) * (logvar/2).exp() + mu
-
-        rec = self.decoder(z)
-        return rec, mu, logvar
+        mu = self.encoder(x)
+        rec = self.decoder(mu)
+        return rec, mu
 
 def test_video_dcae():
     from dataclasses import dataclass
@@ -270,26 +206,19 @@ def test_video_dcae():
         channels = 3
         latent_size = 16
         latent_channels = 16
-        ch_0 = 256
-        ch_max = 2048
-        d_model = 768
-        n_heads = 12
-        encoder_blocks_per_stage = [4, 4, 4, 8]
-        decoder_blocks_per_stage = [4, 4, 4, 8]
-        tokens_per_frame = 256
-        rope_impl = "video"
-        n_frames = 16
+        ch_0 = 64
+        ch_max = 512
+        encoder_blocks_per_stage = [2, 2, 4]
+        decoder_blocks_per_stage = [2, 2, 4]
     
     config = VideoDCAEConfig()
     model = VideoDCAE(config)
     model = model.cuda().bfloat16()
 
     with torch.no_grad():
-        x = torch.randn(1, config.n_frames, config.channels, config.sample_size[0], config.sample_size[1]).cuda().bfloat16()
-        mu, logvar = model.encoder(x)
-        print(mu.shape)
-        print(logvar.shape)
-        z = torch.randn_like(mu) * (logvar/2).exp() + mu
+        x = torch.randn(1, 16, config.channels, config.sample_size[0], config.sample_size[1]).cuda().bfloat16()
+        z = model.encoder(x)
+        print(z.shape)
         rec = model.decoder(z)
         print(rec.shape)
 

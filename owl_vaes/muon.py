@@ -123,6 +123,21 @@ class CombinedOptimizer(Optimizer):
         adamw_parameters = [p for n, p in model.named_parameters() if any(key in n for key in adamw_keys) or p.ndim < 2]
         muon_parameters = [p for n, p in model.named_parameters() if not any(key in n for key in adamw_keys) and p.ndim >= 2]
 
+        if rank == 0:
+            muon_param_names = []
+            adamw_param_names = []
+            for n, p in model.named_parameters():
+                if not any(key in n for key in adamw_keys) and p.ndim >= 2:
+                    muon_param_names.append(n)
+                if any(key in n for key in adamw_keys) or p.ndim < 2:
+                    adamw_param_names.append(n)
+            with open("muon_params.txt", "w") as f:
+                for name in muon_param_names:
+                    f.write(f"{name}\n")
+            with open("adamw_params.txt", "w") as f:
+                for name in adamw_param_names:
+                    f.write(f"{name}\n")
+
         unmatched_keys = []
         named_parameters = dict(model.named_parameters())
         for key in adamw_keys:

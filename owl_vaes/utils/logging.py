@@ -53,6 +53,7 @@ class LogHelper:
 
         self.data = {}
         return final
+
 # ==== IMAGES ====
 
 def to_wandb(x1, x2, gather = False):
@@ -146,7 +147,7 @@ def to_wandb_video(x):
     x = x.numpy()
     return [wandb.Video(x_i, fps=10, format="gif") for x_i in x]
 
-def to_wandb_video_sidebyside(original, reconstructed):
+def to_wandb_video_sidebyside(original, reconstructed, fps = 10):
     """
     Create side-by-side video comparisons of original and reconstructed videos.
     
@@ -176,8 +177,8 @@ def to_wandb_video_sidebyside(original, reconstructed):
     rec = to_vid(reconstructed)
 
     wandb_dict = {
-        'original' : [wandb.Video(rgb_i, fps=10, format="mp4") for rgb_i in rgb],
-        'reconstructed' : [wandb.Video(rec_i, fps=10, format="mp4") for rec_i in rec],
+        'original' : [wandb.Video(rgb_i, fps=fps, format="mp4") for rgb_i in rgb],
+        'reconstructed' : [wandb.Video(rec_i, fps=fps, format="mp4") for rec_i in rec],
     }
     
     return wandb_dict

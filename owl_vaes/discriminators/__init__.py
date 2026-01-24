@@ -24,3 +24,6 @@ def get_discriminator_cls(model_id):
     if model_id == "seraena":
         from .seraena import SeraenaDiscriminator
         return SeraenaDiscriminator
+    if model_id == "basic":
+        from .basic import BasicDiscriminator
+        return BasicDiscriminator
