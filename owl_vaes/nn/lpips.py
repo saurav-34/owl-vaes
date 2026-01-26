@@ -4,13 +4,18 @@ import torch.nn.functional as F
 from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
 
 from lpips import LPIPS # Make sure this is my custom LPIPS, not pip install LPIPS
+from dino_perceptual import DINOPerceptual  
 from .augs import PairedRandomAffine
+
+from ..losses.vitok import sample_tiles
 
 def get_lpips_cls(lpips_id):
     if lpips_id == "vgg":
         return VGGLPIPS
     elif lpips_id == "convnext":
         return ConvNextLPIPS
+    elif lpips_id == "dino":
+        return DinoLPIPS
         
 # vgg takes 224 sized images
 def vgg_patchify(x):
@@ -115,4 +120,16 @@ class ConvNextLPIPS(nn.Module):
         real = cn_patchify(real)
         return self.loss(fake, real)
         
-        
+class DinoLPIPS(nn.Module):
+    def __init__(self, device, side_lengths=256):
+        super().__init__()
+
+        self.loss = DINOPerceptual(model_size='S', target_size=side_lengths)
+        self.loss = self.loss.to(device).eval()
+        self.loss = torch.compile(self.loss)
+    
+    @torch.autocast('cuda', dtype=torch.bfloat16)
+    def forward(self, fake, real):
+        fake_tiles, real_tiles = sample_tiles(fake, real, n_tiles=2)
+        loss = self.loss(fake_tiles, real_tiles).mean()
+        return loss

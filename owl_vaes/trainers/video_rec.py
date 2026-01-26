@@ -21,6 +21,7 @@ from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
 from ..losses.dwt import dwt_loss_fn_3d
 from ..losses.outlier import outlier_penalty_loss
+from ..losses.vitok import charbonnier_loss_fn, ssim_loss_fn
 from ..sampling.tiling_3d import tiled_rec
 
 class VideoRecTrainer(BaseTrainer):
@@ -68,7 +69,7 @@ class VideoRecTrainer(BaseTrainer):
 
     def load(self):
         if self.train_cfg.resume_ckpt is not None:
-            save_dict = super().load(self.train_cfg.resume_ckpt)
+            save_dict = super().load(self.train_cfg.resume_ckpt, self.train_cfg.checkpoint_dir)
         else:
             return
 
@@ -89,6 +90,8 @@ class VideoRecTrainer(BaseTrainer):
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
         opl_weight = self.train_cfg.loss_weights.get('opl', 0.0)
+        ssim_weight = self.train_cfg.loss_weights.get('ssim', 0.0)
+        charb_weight = self.train_cfg.loss_weights.get('charb', 0.0)
 
         # Prepare model, lpips, ema
         self.model = self.model.cuda().train()
@@ -158,7 +161,6 @@ class VideoRecTrainer(BaseTrainer):
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
-                full_batch = batch.clone()
                 batch = video_interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
@@ -180,10 +182,20 @@ class VideoRecTrainer(BaseTrainer):
                         metrics.log('dwt_loss', dwt_loss)
 
                     if lpips_weight > 0.0:
-                        lpips_loss = lpips(flatten_vid(batch_rec), flatten_vid(batch)) / accum_steps
+                        lpips_loss = lpips(batch_rec, batch) / accum_steps
                         total_loss += lpips_loss
                         metrics.log('lpips_loss', lpips_loss)
-                    
+
+                    if ssim_weight > 0.0:
+                        ssim_loss = ssim_loss_fn(batch_rec, batch) / accum_steps
+                        total_loss += ssim_loss
+                        metrics.log('ssim_loss', ssim_loss)
+
+                    if charb_weight > 0.0:
+                        charb_loss = charbonnier_loss_fn(batch_rec, batch) / accum_steps
+                        total_loss += charb_loss
+                        metrics.log('charb_loss', charb_loss)
+
                     if opl_weight > 0.0:
                         opl_loss = outlier_penalty_loss(flatten_vid(z)) * opl_weight
                         total_loss += opl_loss
@@ -203,7 +215,7 @@ class VideoRecTrainer(BaseTrainer):
                 if local_step % accum_steps == 0:
                     # Updates
                     self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
@@ -243,7 +255,11 @@ class VideoRecTrainer(BaseTrainer):
 
                     self.total_step_counter += 1
                     if self.total_step_counter % self.train_cfg.save_interval == 0:
+                        torch.cuda.synchronize()  # Ensure all GPU ops complete before saving
+                        self.barrier()  # Sync all ranks before rank 0 saves
                         if self.rank == 0:
                             self.save()
-
-                    self.barrier()
+                        self.barrier()  # Sync all ranks after saving
+                        torch.cuda.synchronize()  # Ensure GPU is clean before continuing
+                    else:
+                        self.barrier()
