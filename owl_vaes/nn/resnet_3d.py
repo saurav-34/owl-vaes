@@ -9,10 +9,14 @@ from torch.nn.utils.parametrizations import weight_norm
 
 from .resnet import Upsample, Downsample
 
+def checkpoint_gpu(fn, *args, **kwargs):
+    kwargs.setdefault("use_reentrant", False)
+    return torch_checkpoint(fn, *args, **kwargs)
+
 def WeightNormConv3d(*args, **kwargs):
     return weight_norm(nn.Conv3d(*args, **kwargs))
 
-def causal_pad(x, p = 1, k = 3):
+def causal_pad(x, p = 1, k = 3, do_causal_pad=True):
     # x is [b,c,t,h,w]
     # Spatial padding: replicate (constant works too)
     # Temporal padding: replicate to avoid zero boundary at first frame
@@ -23,7 +27,7 @@ def causal_pad(x, p = 1, k = 3):
 
     # Pad temporally (causal - only left/past side)
     # Replicate first frame backward instead of zeros
-    temporal_pad = math.ceil(k/2)
+    temporal_pad = math.ceil(k/2) if do_causal_pad else 0
     x = F.pad(x, (0, 0, 0, 0, temporal_pad, 0), mode="replicate")
 
     return x
@@ -35,9 +39,15 @@ class CausConv3d(nn.Module):
         self.conv = WeightNormConv3d(fi, fo, k, s, 0)
         self.k = k
         self.p = p
+
+        self.cache_id = None
     
-    def forward(self, x):
-        x = causal_pad(x, self.p, self.k)
+    def forward(self, x, feat_cache : 'ConvCache' = None):
+        do_pad = True
+        if feat_cache is not None:
+            x, do_pad = feat_cache.update(self.cache_id, x)
+
+        x = causal_pad(x, self.p, self.k, do_causal_pad=do_pad)
         x = self.conv(x)
         return x
 
@@ -65,13 +75,17 @@ class ResBlock3D(nn.Module):
 
         nn.init.zeros_(self.conv3.conv.weight)
   
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
+        def _forward(x):
+            x = self.conv1(x, feat_cache)
+            x = self.act1(x)
+            x = self.conv2(x, feat_cache)
+            x = self.act2(x)
+            x = self.conv3(x, feat_cache)
+            return x
+
         res = x
-        x = self.conv1(x)
-        x = self.act1(x)
-        x = self.conv2(x)
-        x = self.act2(x)
-        x = self.conv3(x)
+        x = checkpoint_gpu(_forward, x)
         x = x + res
         return x
 
@@ -81,8 +95,8 @@ class TemporalUpsample(nn.Module):
 
         self.proj = CausConv3d(ch_in, ch_out*2, 3, 1, 1)
 
-    def forward(self, x):
-        x = self.proj(x) # [b, c*2, t, h, w]
+    def forward(self, x, feat_cache = None):
+        x = self.proj(x, feat_cache) # [b, c*2, t, h, w]
         x = eo.rearrange(x, 'b (c two) t h w -> b c (t two) h w', two = 2)
         return x
 
@@ -103,8 +117,8 @@ class TemporalDownsample(nn.Module):
 
         self.proj = CausConv3d(ch_in, ch_out//2, 3, 1, 1)
 
-    def forward(self, x):
-        x = self.proj(x) # [b, c//2, t, h, w]
+    def forward(self, x, feat_cache = None):
+        x = self.proj(x, feat_cache) # [b, c//2, t, h, w]
         x = eo.rearrange(x, 'b c (t two) h w -> b (c two) t h w', two = 2)
         return x
 
@@ -129,10 +143,10 @@ class UpBlock3D(nn.Module):
             blocks.append(ResBlock3D(ch_out, total_blocks))
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         x = self.up(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, feat_cache)
         return x
 
 class DownBlock3D(nn.Module):
@@ -145,9 +159,9 @@ class DownBlock3D(nn.Module):
             blocks.append(ResBlock3D(ch_in, total_blocks))
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         for block in self.blocks:
-            x = block(x)
+            x = block(x, feat_cache)
         x = self.down(x)
         return x
 
@@ -210,11 +224,11 @@ class LandscapeToSquare3D(nn.Module):
         if ch_out is None: ch_out = ch
         self.proj = CausConv3d(ch, ch_out, 3, 1, 1)
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         # x is [b, c, t, h, w] where h:w is 9:16
         b, c, t, h, w = x.shape
         target_h, target_w = find_nearest_square(h, w)
-        x = self.proj(x)
+        x = self.proj(x, feat_cache)
         # Interpolate spatially only per-frame
         x = video_interpolate(x, size=(target_h, target_w), mode='bilinear')
         return x
@@ -226,12 +240,12 @@ class SquareToLandscape3D(nn.Module):
         if ch_out is None: ch_out = ch
         self.proj = CausConv3d(ch, ch_out, 3, 1, 1)
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         # x is [b, c, t, h, w] where h:w is 1:1
         b, c, t, h, w = x.shape
         target_h, target_w = find_nearest_landscape(h, w)
         # Interpolate FIRST (spatially only per-frame)
         x = video_interpolate(x, size=(target_h, target_w), mode='bilinear')
         # Then learned conv to fix artifacts
-        x = self.proj(x)
+        x = self.proj(x, feat_cache)
         return x

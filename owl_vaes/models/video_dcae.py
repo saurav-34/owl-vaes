@@ -57,6 +57,10 @@ def latent_ln(z, eps=1e-6):
     var  = z.var(dim=(1, 2, 3, 4), keepdim=True, unbiased=False)
     return (z - mean) / torch.sqrt(var + eps)
 
+class PermissiveIdentity(nn.Module):
+    def forward(self, x, *args, **kwargs):
+        return x
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
@@ -72,7 +76,7 @@ class Encoder(nn.Module):
         self.encoder_chunk_size = getattr(config, 'encoder_chunk_size', 4)
 
         # Landscape to square transformation (keeps channels same, just reshapes spatially)
-        self.l2s = LandscapeToSquare3D(config.channels, config.channels) if self.is_landscape else nn.Identity()
+        self.l2s = LandscapeToSquare3D(config.channels, config.channels) if self.is_landscape else PermissiveIdentity()
 
         self.conv_in = CausConv3d(config.channels * 4, ch_0, 3, 1, 1)
 
@@ -91,7 +95,7 @@ class Encoder(nn.Module):
 
             blocks.append(DownBlock3D(ch, next_ch, block_count, total_blocks))
             residuals.append(SpaceToChannel3D(ch, next_ch))
-            temp_downs.append(TemporalDownsample(next_ch, next_ch) if is_temporal else nn.Identity())
+            temp_downs.append(TemporalDownsample(next_ch, next_ch) if is_temporal else PermissiveIdentity())
 
             ch = next_ch
 
@@ -101,21 +105,21 @@ class Encoder(nn.Module):
 
         self.conv_out = ChannelAverage3D(ch, config.latent_channels)
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         """
         btchw in -> btchw out
         """
         b = x.shape[0]
         x = swap_tc(x) # -> bcthw
-        x = self.l2s(x) # landscape -> square if needed
+        x = self.l2s(x, feat_cache) # landscape -> square if needed
         x = flatten_pixel_unshuffle(x)
-        x = self.conv_in(x)
+        x = self.conv_in(x, feat_cache)
 
         for block, shortcut, temp_down in zip(self.blocks, self.residuals, self.temp_downs):
-            x = block(x) + shortcut(x)
-            x = temp_down(x)
+            x = block(x, feat_cache) + shortcut(x)
+            x = temp_down(x, feat_cache)
 
-        mu = self.conv_out(x)
+        mu = self.conv_out(x, feat_cache)
         mu = latent_ln(mu)
         mu = swap_ct(mu)
         return mu
@@ -148,7 +152,7 @@ class Decoder(nn.Module):
 
             is_temporal = (i < 2)
 
-            temp_ups.append(TemporalUpsample(next_ch, next_ch) if is_temporal else nn.Identity())
+            temp_ups.append(TemporalUpsample(next_ch, next_ch) if is_temporal else PermissiveIdentity())
             blocks.append(UpBlock3D(next_ch, ch, block_count, total_blocks))
             residuals.append(ChannelToSpace3D(next_ch, ch))
 
@@ -162,22 +166,22 @@ class Decoder(nn.Module):
         self.conv_out = CausConv3d(ch_0, config.channels*4, 3, 1, 1)
 
         # Square to landscape transformation (keeps channels same, just reshapes spatially)
-        self.s2l = SquareToLandscape3D(config.channels, config.channels) if self.is_landscape else nn.Identity()
+        self.s2l = SquareToLandscape3D(config.channels, config.channels) if self.is_landscape else PermissiveIdentity()
         
 
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         b = x.shape[0]
         x = swap_tc(x)
-        x = self.conv_in(x)
+        x = self.conv_in(x, feat_cache)
 
         for block, shortcut, temp_up in zip(self.blocks, self.residuals, self.temp_ups):
-            x = temp_up(x)
-            x = block(x) + shortcut(x)
+            x = temp_up(x, feat_cache)
+            x = block(x, feat_cache) + shortcut(x)
 
         x = self.act_out(x)
-        x = self.conv_out(x)
+        x = self.conv_out(x, feat_cache)
         x = flatten_pixel_shuffle(x)
-        x = self.s2l(x) # square -> landscape if needed
+        x = self.s2l(x, feat_cache) # square -> landscape if needed
         x = swap_ct(x)
         return x
 
@@ -193,9 +197,9 @@ class VideoDCAE(nn.Module):
 
         self.config = config
         
-    def forward(self, x):
-        mu = self.encoder(x)
-        rec = self.decoder(mu)
+    def forward(self, x, feat_cache = None):
+        mu = self.encoder(x, feat_cache)
+        rec = self.decoder(mu, feat_cache)
         return rec, mu
 
 def test_video_dcae():

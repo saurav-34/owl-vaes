@@ -29,8 +29,8 @@ class SpaceToChannel3D(nn.Module):
 
         self.proj = CausConv3d(ch_in, ch_out // 4, 3, 1, 1)
 
-    def forward(self, x):
-        x = self.proj(x)
+    def forward(self, x, feat_cache = None):
+        x = self.proj(x, feat_cache)
         x = flatten_pixel_unshuffle(x)
         return x
 
@@ -40,8 +40,8 @@ class ChannelToSpace3D(nn.Module):
 
         self.proj = CausConv3d(ch_in, 4 * ch_out, 3, 1, 1)
     
-    def forward(self, x):
-        x = self.proj(x)
+    def forward(self, x, feat_cache = None):
+        x = self.proj(x, feat_cache)
         x = flatten_pixel_shuffle(x)
         return x
 
@@ -52,9 +52,9 @@ class ChannelAverage3D(nn.Module):
         self.proj = CausConv3d(ch_in, ch_out, 3, 1, 1)
         self.grps = ch_in // ch_out
     
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         res = x
-        x = self.proj(x)
+        x = self.proj(x, feat_cache)
         res = res.view(res.shape[0], self.grps, res.shape[1] // self.grps, res.shape[2], res.shape[3], res.shape[4])
         res = res.mean(dim=1)
         return res + x
@@ -66,8 +66,8 @@ class ChannelDuplication3D(nn.Module):
         self.proj = CausConv3d(ch_in, ch_out, 3, 1, 1)
         self.reps = ch_out // ch_in
     
-    def forward(self, x):
+    def forward(self, x, feat_cache = None):
         res = x
-        x = self.proj(x)
+        x = self.proj(x, feat_cache)
         res = res.repeat_interleave(self.reps, dim=1)
         return res + x
