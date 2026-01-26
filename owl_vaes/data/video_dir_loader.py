@@ -16,7 +16,7 @@ class RandomRGBFromMP4s:
     - No persistent handles: each yield opens the chosen file once and closes it.
     - Duration/fps are computed lazily on first use and cached in memory.
     """
-    def __init__(self, source, seed=None, target_size=(360,640), window_length=1, suppress_warnings = True):
+    def __init__(self, source, seed=None, target_size=(360,640), window_length=1, suppress_warnings = True, min_brightness=10.0):
         # Ensure source is a list
         if isinstance(source, str):
             source = [source]
@@ -30,6 +30,7 @@ class RandomRGBFromMP4s:
         self.rng = random.Random(seed)
         self.meta = {}  # path -> (duration_s, fps, eps_end_s)
         self.suppress_warnings = suppress_warnings
+        self.min_brightness = min_brightness  # Minimum mean pixel value (0-255 scale)
 
     @staticmethod
     def _find_mp4s(spec):
@@ -47,6 +48,17 @@ class RandomRGBFromMP4s:
                 # treat as (possibly absolute) glob pattern
                 out += glob.glob(s, recursive=True)
         return [Path(x) for x in sorted({x for x in out if x.lower().endswith(".mp4")})]
+
+    def _is_valid_video(self, frames):
+        """Check if video frames are not mostly black/corrupted."""
+        if isinstance(frames, list):
+            # Multiple frames: check mean brightness across all
+            mean_brightness = np.mean([frame.mean() for frame in frames])
+        else:
+            # Single frame
+            mean_brightness = frames.mean()
+
+        return mean_brightness >= self.min_brightness
 
     def __iter__(self):
         return self
