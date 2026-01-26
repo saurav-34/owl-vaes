@@ -1,0 +1,82 @@
+model:
+  model_id: video_dcae
+  sample_size: [360, 640]
+  channels: 3
+  latent_size: 8
+  latent_channels: 16
+
+  ch_0: 128
+  ch_max: 1024
+
+  encoder_blocks_per_stage: [2, 1, 1, 2]
+  decoder_blocks_per_stage: [3, 2, 2, 3]
+
+train:
+  trainer_id: video_rec
+  data_id: video_dir_loader
+  data_kwargs:
+    source: 
+     - /mnt/data/waypoint_1/data/MKIF/*/*.mp4 
+     - /mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
+    target_size: [360, 640]
+    window_length: 4
+
+  target_batch_size: 32
+  batch_size: 4
+
+  epochs: 200
+
+#  opt: AdamW
+#  opt_kwargs:
+#    lr: 3.0e-5
+#    betas: [0.9, 0.99]
+#    eps: 1.0e-6
+
+  opt: Muon
+  opt_kwargs:
+    lr: 3.5e-5
+    momentum: 0.95
+    adamw_lr: 3.0e-5
+    adamw_wd: 1.0e-2
+    adamw_eps: 1.0e-6
+    adamw_betas: [0.9, 0.999]
+    adamw_keys:
+      - encoder.conv_in
+      - encoder.conv_out
+      - .residuals.
+      - .temp_downs.
+      - .temp_ups.
+      - decoder.conv_in
+      - decoder.conv_out
+      - decoder.s2l
+      - decoder.act_out
+      - decoder.conv_out
+
+  lpips_type: dino
+  loss_weights:
+    lpips: 250.0
+    charb: 1.0
+    ssim: 0.1
+
+  scheduler: LinearWarmupWithCosineDecay
+  scheduler_kwargs:
+    warmup_steps: 3000
+    decay_after: 120000
+    decay_steps: 220000
+    start_mult: 0.1
+    decay_to_mult: 0.1
+
+  checkpoint_dir: checkpoints/waypoint_1_vae_owlc_f32_c16_720p
+  resume_ckpt: latest
+
+  sample_interval: 250
+  save_interval: 1000
+  sample_window_length: 60
+  sample_fps: 15
+
+wandb:
+  name: shahbuland
+  project: video_vaes
+  run_name: 'f32 c16 720p'
