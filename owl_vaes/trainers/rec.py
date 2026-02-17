@@ -134,6 +134,7 @@ class RecTrainer(BaseTrainer):
 
         local_step = 0
         for _ in range(self.train_cfg.epochs):
+            print(f"Starting epoch {_+1} with lr {self.opt.param_groups[0]['lr']}")
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
@@ -210,6 +211,7 @@ class RecTrainer(BaseTrainer):
                                 full_batch.detach().contiguous().bfloat16(),
                                 full_batch_rec.detach().contiguous().bfloat16(),
                                 gather = False
+                                
                             )
                         if self.rank == 0:
                             wandb.log(wandb_dict)

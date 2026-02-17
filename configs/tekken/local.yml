@@ -1,0 +1,23 @@
+name: owl-wms-setup
+
+resources:
+  cloud: kubernetes
+  accelerators: H200:8
+
+
+#workdir: owl-wms
+
+setup: |
+  #apt install rdma-core libibverbs1 libibverbs-dev infiniband-diags -y
+  #apt install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1
+
+run: |
+  cd ~/anmol/owl-vaes
+  conda activate vae_finetuning 
+
+  # git checkout main
+  # git pull
+  # git submodule update --init --recursive
+
+  # torchrun --nproc_per_node=8 -m train --config configs/combat/combat_v0_t3vae_L.yml
+  RUN_NAME="vae_finetuning" torchrun --nproc_per_node=8  -m train --config_path configs/tekken/owl_vae_finetune_v1.yml
